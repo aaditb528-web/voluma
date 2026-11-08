@@ -1,0 +1,823 @@
+//! Rich per-record metadata extracted from a single FILE record.
+
+use crate::NtfsName;
+use std::fmt;
+
+use super::{
+    capture::resident_reparse_tag,
+    fold::{AttributeConsumer, fold_record_attributes},
+    names::{FileNameSelector, current_file_name},
+};
+
+use crate::{
+    FileAttributes, Filetime, NtfsFileReference,
+    raw_mft::layout::{
+        attribute::{
+            FileNameNamespace, NtfsAttribute, attr_header_flags, file_attr_flags,
+            ntfs_name_from_utf16le,
+        },
+        record::FileRecord,
+    },
+};
+
+#[derive(Clone, Copy)]
+pub(crate) struct EntryBuildOptions {
+    pub(crate) collect_alternate_data_streams: bool,
+    pub(crate) collect_dos_file_name_links: bool,
+    pub(crate) cluster_size: u64,
+}
+
+impl EntryBuildOptions {
+    pub(crate) const fn full() -> Self {
+        Self {
+            collect_alternate_data_streams: true,
+            collect_dos_file_name_links: true,
+            cluster_size: 4096,
+        }
+    }
+}
+
+/// Raw `$ATTRIBUTE_LIST` data captured from a FILE record, used by
+/// `from_record_with_attr_list` so the caller can load extension records
+/// and enrich the entry with the best-namespace `$FILE_NAME`.
+///
+/// Extension records exist when a file's attribute set overflows a single
+/// 1 KiB FILE record (e.g. a file with many hard links).
+#[derive(Debug)]
+pub(crate) enum AttributeListInfo {
+    /// The attribute list fits inside the FILE record (resident).
+    /// Contains the raw value bytes.
+    Resident(Vec<u8>),
+    /// The attribute list is stored in data runs on disk (non-resident).
+    /// `runs_data` is the raw run-length encoded bytes starting at
+    /// `data_runs_offset`; `data_size` is the total logical size.
+    NonResident { runs_data: Vec<u8>, data_size: u64 },
+}
+
+/// Information about a single named alternate data stream (`$DATA`
+/// attribute with a non-empty attribute name).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct AdsInfo {
+    /// Alternate data stream name.
+    pub name: NtfsName,
+    /// Logical stream size in bytes.
+    pub real_size: u64,
+    /// Allocated stream size in bytes.
+    pub allocated_size: u64,
+    /// Whether the stream data is resident in the FILE record.
+    pub is_resident: bool,
+    /// Whether the stream data is marked sparse.
+    pub is_sparse: bool,
+    /// Whether the stream data is marked compressed.
+    pub is_compressed: bool,
+}
+
+/// One `$FILE_NAME` link carried by an MFT record.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct RawMftLink {
+    /// Parent directory file reference for this link.
+    pub parent_reference: NtfsFileReference,
+    /// Namespace of this specific `$FILE_NAME` attribute.
+    pub namespace: FileNameNamespace,
+    /// Leaf name carried by this link.
+    pub file_name: NtfsName,
+}
+
+/// Comprehensive metadata for one MFT record.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub struct RawMftEntry {
+    // Successfully decoded SI, FILE_NAME, and resident REPARSE_POINT, in three bits.
+    pub(crate) observed_fields: u8,
+    /// Materialization choices that produced this entry. Empty collections do
+    /// not establish absence; use diagnostic or MFT-stream metadata for evidence.
+    pub collection_options: crate::RawMftEntryOptions,
+    /// Record number in the `$MFT`.
+    pub record_number: u64,
+    /// Record sequence number.
+    pub sequence_number: u16,
+    /// Full file reference for this record.
+    pub file_reference: NtfsFileReference,
+    /// Parent directory file reference from `$FILE_NAME`.
+    pub parent_reference: NtfsFileReference,
+    // Packed on-disk value; zero denotes a base record. Avoid enlarging every
+    // entry for the optional public view returned by `base_reference()`.
+    pub(crate) base_reference: NtfsFileReference,
+    /// Number of hard links to the file.
+    pub hard_link_count: u16,
+    /// Raw FILE-record flags.
+    pub flags: u16,
+    /// Whether the record is marked in use.
+    pub is_used: bool,
+    /// Whether the record is marked as a directory.
+    pub is_directory: bool,
+    /// Whether the file is marked as a reparse point.
+    pub is_reparse_point: bool,
+    /// Reparse tag when the file is a reparse point.
+    pub reparse_tag: Option<u32>,
+    /// Namespace of the chosen `$FILE_NAME` attribute.
+    pub namespace: FileNameNamespace,
+
+    /// Leaf file name.
+    pub file_name: NtfsName,
+
+    /// `$STANDARD_INFORMATION` creation timestamp.
+    pub si_created: Filetime,
+    /// `$STANDARD_INFORMATION` last-modified timestamp.
+    pub si_modified: Filetime,
+    /// `$STANDARD_INFORMATION` MFT-record-modified timestamp.
+    pub si_mft_modified: Filetime,
+    /// `$STANDARD_INFORMATION` last-access timestamp.
+    pub si_accessed: Filetime,
+    /// `$STANDARD_INFORMATION` file-attribute flags.
+    pub si_file_attributes: FileAttributes,
+
+    /// `$FILE_NAME` creation timestamp.
+    pub fn_created: Filetime,
+    /// `$FILE_NAME` last-modified timestamp.
+    pub fn_modified: Filetime,
+    /// `$FILE_NAME` MFT-record-modified timestamp.
+    pub fn_mft_modified: Filetime,
+    /// `$FILE_NAME` last-access timestamp.
+    pub fn_accessed: Filetime,
+
+    /// Logical size of the unnamed data stream.
+    pub real_size: u64,
+    /// Allocated size of the unnamed data stream.
+    pub allocated_size: u64,
+    /// Whether the record had an unnamed `$DATA` attribute in the parsed record set.
+    pub has_unnamed_data: bool,
+    /// Whether the unnamed data stream is resident.
+    pub is_resident: bool,
+    /// Whether the unnamed data stream is sparse.
+    pub is_sparse: bool,
+    /// Whether the unnamed data stream is compressed.
+    pub is_compressed: bool,
+    /// Whether the unnamed data stream is encrypted.
+    pub is_encrypted: bool,
+    /// Named alternate data streams attached to the record.
+    pub alternate_data_streams: Box<[AdsInfo]>,
+    /// All `$FILE_NAME` links observed on this record and any loaded extension records.
+    pub links: Box<[RawMftLink]>,
+}
+
+impl fmt::Display for RawMftEntry {
+    /// One-line, compact summary suitable for logging. For a full multi-line
+    /// dump, format the individual public fields.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let kind = if self.is_directory { "DIR " } else { "FILE" };
+        write!(
+            f,
+            "raw #{} {kind} fid={} parent={} links={} size={} \"{}\"",
+            self.record_number,
+            self.file_reference,
+            self.parent_reference,
+            self.hard_link_count,
+            self.real_size,
+            self.file_name.to_string_lossy(),
+        )
+    }
+}
+
+impl RawMftEntry {
+    /// Full base reference for an extension record; `None` for a base record.
+    /// Includes the sequence number, even for extensions of record zero.
+    #[must_use]
+    pub const fn base_reference(&self) -> Option<NtfsFileReference> {
+        if self.base_reference.get() == 0 {
+            None
+        } else {
+            Some(self.base_reference)
+        }
+    }
+
+    /// Metadata observed while materializing this entry, without extra parsing.
+    ///
+    /// Raw scans inspect attributes selectively. This conservative view returns
+    /// `Present { complete: false }`, `Unknown`, or `NotCollected`; it never
+    /// establishes absence or completeness. Zero timestamps and sizes remain
+    /// valid observed values. A tag copied from `$FILE_NAME` does not establish
+    /// the presence of a `$REPARSE_POINT` attribute. For a logical stream,
+    /// [`crate::MftRecord::metadata`] provides the more precise parser evidence.
+    #[must_use]
+    pub fn metadata(&self) -> crate::MftMetadata {
+        use crate::MftFieldState::{NotCollected, Present, Unknown};
+        let observed = |present| {
+            if present {
+                Present { complete: false }
+            } else {
+                Unknown
+            }
+        };
+        crate::MftMetadata {
+            standard_information: observed(self.observed_fields & 1 != 0),
+            file_names: observed(self.observed_fields & 2 != 0),
+            unnamed_data: observed(self.has_unnamed_data),
+            alternate_data_streams: if self.collection_options.collect_alternate_data_streams() {
+                observed(!self.alternate_data_streams.is_empty())
+            } else {
+                NotCollected
+            },
+            reparse_point: observed(self.observed_fields & 4 != 0),
+        }
+    }
+
+    /// Build metadata from a caller-selected, validated attribute sequence.
+    pub(crate) fn from_attributes<'a>(
+        record: &FileRecord<'_>,
+        attributes: impl IntoIterator<Item = NtfsAttribute<'a>>,
+    ) -> Self {
+        Self::from_attributes_with_options(record, attributes, EntryBuildOptions::full())
+    }
+
+    /// Build metadata from selected, validated attributes while preserving the
+    /// live scan's configured collection policy.
+    pub(crate) fn from_attributes_with_options<'a>(
+        record: &FileRecord<'_>,
+        attributes: impl IntoIterator<Item = NtfsAttribute<'a>>,
+        options: EntryBuildOptions,
+    ) -> Self {
+        let mut builder = RawMftEntryBuilder::new(record, options);
+        for attr in attributes {
+            super::fold::fold_attribute(&attr, &mut builder);
+        }
+        builder.build().0
+    }
+
+    /// Build a `RawMftEntry` and also return any `$ATTRIBUTE_LIST` data
+    /// found in the record.
+    ///
+    /// When `Some(AttributeListInfo)` is returned the caller should parse
+    /// the list, find `$FILE_NAME` attribute entries that live in
+    /// extension records, load those records, and update the entry with
+    /// the highest-scoring file-name namespace.
+    pub(crate) fn from_record_with_attr_list(
+        record: &FileRecord<'_>,
+        options: EntryBuildOptions,
+    ) -> (Self, Option<AttributeListInfo>) {
+        let mut builder = RawMftEntryBuilder::new(record, options);
+        fold_record_attributes(record, &mut builder);
+        builder.build()
+    }
+}
+
+struct RawMftEntryBuilder {
+    /// Partially built result entry.
+    entry: RawMftEntry,
+    /// Alternate streams accumulated while walking attributes.
+    alternate_data_streams: Vec<AdsInfo>,
+    /// Shared `$FILE_NAME` selection and link-retention state.
+    file_names: FileNameSelector,
+    /// Whether the unnamed `$DATA` attribute has already been consumed.
+    have_unnamed_data: bool,
+    /// Captured `$ATTRIBUTE_LIST` data, if any.
+    attr_list: Option<AttributeListInfo>,
+    /// Whether to collect alternate data stream names and sizes.
+    collect_alternate_data_streams: bool,
+    /// Volume cluster size in bytes.
+    cluster_size: u64,
+}
+
+impl RawMftEntryBuilder {
+    /// Start building an entry from a validated FILE record.
+    fn new(record: &FileRecord<'_>, options: EntryBuildOptions) -> Self {
+        Self {
+            entry: RawMftEntry {
+                observed_fields: 0,
+                collection_options: crate::RawMftEntryOptions {
+                    collect_alternate_data_streams: options.collect_alternate_data_streams,
+                    collect_dos_file_name_links: options.collect_dos_file_name_links,
+                },
+                record_number: record.number,
+                sequence_number: record.sequence_value(),
+                file_reference: NtfsFileReference::new(record.file_reference()),
+                parent_reference: NtfsFileReference::new(0),
+                base_reference: NtfsFileReference::new(record.base_reference()),
+                hard_link_count: record.link_count(),
+                flags: record.header.flags,
+                is_used: record.is_used(),
+                is_directory: record.is_directory(),
+                is_reparse_point: false,
+                reparse_tag: None,
+                namespace: FileNameNamespace::Posix,
+                file_name: NtfsName::new(),
+                si_created: Filetime::new(0),
+                si_modified: Filetime::new(0),
+                si_mft_modified: Filetime::new(0),
+                si_accessed: Filetime::new(0),
+                si_file_attributes: FileAttributes::empty(),
+                fn_created: Filetime::new(0),
+                fn_modified: Filetime::new(0),
+                fn_mft_modified: Filetime::new(0),
+                fn_accessed: Filetime::new(0),
+                real_size: 0,
+                allocated_size: 0,
+                has_unnamed_data: false,
+                is_resident: true,
+                is_sparse: false,
+                is_compressed: false,
+                is_encrypted: false,
+                alternate_data_streams: Box::default(),
+                links: Box::default(),
+            },
+            alternate_data_streams: Vec::new(),
+            file_names: FileNameSelector::new(options.collect_dos_file_name_links),
+            have_unnamed_data: false,
+            attr_list: None,
+            collect_alternate_data_streams: options.collect_alternate_data_streams,
+            cluster_size: if options.cluster_size > 0 { options.cluster_size } else { 4096 },
+        }
+    }
+
+    /// Fold `$STANDARD_INFORMATION` values into the entry.
+    fn apply_standard_information(&mut self, attr: &NtfsAttribute<'_>) {
+        if let Some(si) = attr.as_standard_info() {
+            self.entry.observed_fields |= 1;
+            self.entry.si_created = Filetime::new(si.creation_time);
+            self.entry.si_modified = Filetime::new(si.modification_time);
+            self.entry.si_mft_modified = Filetime::new(si.mft_record_modification_time);
+            self.entry.si_accessed = Filetime::new(si.access_time);
+            self.entry.si_file_attributes = FileAttributes::from_bits_retain(si.file_attributes);
+        }
+    }
+
+    /// Fold a `$FILE_NAME` attribute into the entry when it has the best namespace so far.
+    fn apply_file_name(&mut self, attr: &NtfsAttribute<'_>) {
+        if let Some((header, name_bytes)) = attr.as_file_name() {
+            let Some(file_name) = ntfs_name_from_utf16le(name_bytes) else {
+                return;
+            };
+            self.entry.observed_fields |= 2;
+            let ns = FileNameNamespace::from_u8(header.namespace);
+            let parent_reference = NtfsFileReference::new(header.parent_directory_reference);
+            let should_replace = self.file_names.consider(
+                current_file_name(
+                    self.entry.namespace,
+                    self.entry.parent_reference,
+                    &self.entry.file_name,
+                ),
+                ns,
+                parent_reference,
+                &file_name,
+            );
+            if should_replace {
+                self.entry.namespace = ns;
+                self.entry.file_name = file_name;
+                self.entry.parent_reference = parent_reference;
+                self.entry.fn_created = Filetime::new(header.creation_time);
+                self.entry.fn_modified = Filetime::new(header.modification_time);
+                self.entry.fn_mft_modified = Filetime::new(header.mft_record_modification_time);
+                self.entry.fn_accessed = Filetime::new(header.access_time);
+                let fa = header.file_attributes;
+                if fa & file_attr_flags::REPARSE_POINT != 0 {
+                    self.entry.is_reparse_point = true;
+                    self.entry.reparse_tag = Some(header.reparse_point_tag);
+                }
+            }
+        }
+    }
+
+    /// Fold a `$DATA` attribute into the unnamed stream or ADS list.
+    fn apply_data_attribute(&mut self, attr: &NtfsAttribute<'_>) {
+        let stream_name = attr.name_bytes();
+        if attr.is_non_resident() {
+            if let Some(h) = attr.nonresident_header() {
+                let attr_flags = attr.flags();
+                let is_compressed = attr_flags & attr_header_flags::COMPRESSED != 0;
+                let is_sparse = attr_flags & attr_header_flags::SPARSE != 0;
+                let allocated_size = if is_sparse || is_compressed {
+                    let runs_offset = h.data_runs_offset as usize;
+                    let attr_bytes = attr.data();
+                    let cluster_size = if self.cluster_size > 0 { self.cluster_size } else { 4096 };
+                    if runs_offset <= attr_bytes.len() {
+                        let mut sum_clusters = 0u64;
+                        if let Ok(runs) = crate::raw_mft::layout::data_run::decode_runs(&attr_bytes[runs_offset..]) {
+                            for run in runs {
+                                if let crate::raw_mft::layout::data_run::DataRun::Data { clusters, .. } = run {
+                                    sum_clusters = sum_clusters.saturating_add(clusters);
+                                }
+                            }
+                        }
+                        sum_clusters.saturating_mul(cluster_size)
+                    } else {
+                        h.allocated_size
+                    }
+                } else {
+                    h.allocated_size
+                };
+                self.apply_nonresident_data(stream_name, allocated_size, h.data_size, attr);
+            }
+            return;
+        }
+        if let Some(h) = attr.resident_header() {
+            self.apply_resident_data(stream_name, h.value_length as u64);
+        }
+    }
+
+    /// Fold a non-resident `$DATA` attribute into the entry.
+    fn apply_nonresident_data(
+        &mut self,
+        stream_name: Option<&[u8]>,
+        allocated_size: u64,
+        data_size: u64,
+        attr: &NtfsAttribute<'_>,
+    ) {
+        let attr_flags = attr.flags();
+        let is_compressed = attr_flags & attr_header_flags::COMPRESSED != 0;
+        let is_encrypted = attr_flags & attr_header_flags::ENCRYPTED != 0;
+        let is_sparse = attr_flags & attr_header_flags::SPARSE != 0;
+        match stream_name {
+            None => {
+                if !self.have_unnamed_data {
+                    self.have_unnamed_data = true;
+                    self.entry.real_size = data_size;
+                    self.entry.allocated_size = allocated_size;
+                    self.entry.has_unnamed_data = true;
+                    self.entry.is_resident = false;
+                    self.entry.is_compressed |= is_compressed;
+                    self.entry.is_encrypted |= is_encrypted;
+                    self.entry.is_sparse |= is_sparse;
+                }
+            }
+            Some(name_bytes) => {
+                if self.collect_alternate_data_streams
+                    && let Some(name) = ntfs_name_from_utf16le(name_bytes)
+                {
+                    self.alternate_data_streams.push(AdsInfo {
+                        name,
+                        real_size: data_size,
+                        allocated_size,
+                        is_resident: false,
+                        is_sparse,
+                        is_compressed,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Fold a resident `$REPARSE_POINT` attribute into the entry.
+    fn apply_reparse_point_attribute(&mut self, attr: &NtfsAttribute<'_>) {
+        let Some(reparse_tag) = resident_reparse_tag(attr) else {
+            return;
+        };
+        self.entry.is_reparse_point = true;
+        self.entry.reparse_tag = Some(reparse_tag);
+        self.entry.observed_fields |= 4;
+    }
+
+    /// Fold a resident `$DATA` attribute into the entry.
+    fn apply_resident_data(&mut self, stream_name: Option<&[u8]>, value_length: u64) {
+        match stream_name {
+            None => {
+                if !self.have_unnamed_data {
+                    self.have_unnamed_data = true;
+                    self.entry.real_size = value_length;
+                    self.entry.allocated_size = value_length;
+                    self.entry.has_unnamed_data = true;
+                    self.entry.is_resident = true;
+                }
+            }
+            Some(name_bytes) => {
+                if self.collect_alternate_data_streams
+                    && let Some(name) = ntfs_name_from_utf16le(name_bytes)
+                {
+                    self.alternate_data_streams.push(AdsInfo {
+                        name,
+                        real_size: value_length,
+                        allocated_size: value_length,
+                        is_resident: true,
+                        is_sparse: false,
+                        is_compressed: false,
+                    });
+                }
+            }
+        }
+    }
+
+    /// Finalize the entry and return any captured `$ATTRIBUTE_LIST`.
+    fn build(mut self) -> (RawMftEntry, Option<AttributeListInfo>) {
+        self.fold_si_flags();
+        self.entry.alternate_data_streams = self.alternate_data_streams.into_boxed_slice();
+        self.entry.links = self.file_names.into_links();
+        (self.entry, self.attr_list)
+    }
+
+    /// Fold `$STANDARD_INFORMATION` bits into the derived convenience flags.
+    fn fold_si_flags(&mut self) {
+        // SI flags fold-in for sparse/compressed/encrypted (covers some
+        // edge cases where the unnamed $DATA flags weren't set).
+        let si_bits = self.entry.si_file_attributes.bits();
+        if si_bits & file_attr_flags::SPARSE_FILE != 0 {
+            self.entry.is_sparse = true;
+        }
+        if si_bits & file_attr_flags::COMPRESSED != 0 {
+            self.entry.is_compressed = true;
+        }
+        if si_bits & file_attr_flags::ENCRYPTED != 0 {
+            self.entry.is_encrypted = true;
+        }
+        if si_bits & file_attr_flags::REPARSE_POINT != 0 {
+            self.entry.is_reparse_point = true;
+        }
+    }
+}
+
+impl AttributeConsumer for RawMftEntryBuilder {
+    fn on_standard_information(&mut self, attr: &NtfsAttribute<'_>) {
+        self.apply_standard_information(attr);
+    }
+
+    fn on_file_name(&mut self, attr: &NtfsAttribute<'_>) {
+        self.apply_file_name(attr);
+    }
+
+    fn on_data(&mut self, attr: &NtfsAttribute<'_>) {
+        self.apply_data_attribute(attr);
+    }
+
+    fn on_reparse_point(&mut self, attr: &NtfsAttribute<'_>) {
+        self.apply_reparse_point_attribute(attr);
+    }
+
+    fn on_attribute_list(&mut self, attr_list: AttributeListInfo) {
+        self.attr_list = Some(attr_list);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::raw_mft::layout::{
+        attribute::{
+            FileNameNamespace, NtfsAttributeHeader, NtfsAttributeType, NtfsFileNameHeader,
+            NtfsResidentAttributeHeader, NtfsStandardInformation,
+        },
+        record::{FILE_RECORD_SIGNATURE, FileRecord, FileRecordHeader, flags as record_flags},
+    };
+    use std::mem::size_of;
+
+    fn write_resident_attr(buf: &mut Vec<u8>, type_id: u32, attr_name: &[u16], value: &[u8]) {
+        let header_size = size_of::<NtfsResidentAttributeHeader>();
+        let name_off = header_size;
+        let name_bytes = attr_name.len() * 2;
+        let value_off_unaligned = name_off + name_bytes;
+        // 8-byte alignment of value start.
+        let value_off = value_off_unaligned.div_ceil(8) * 8;
+        let total = value_off + value.len();
+        let total_aligned = total.div_ceil(8) * 8;
+        let start = buf.len();
+        buf.resize(start + total_aligned, 0);
+        let header = NtfsResidentAttributeHeader {
+            attribute_header: NtfsAttributeHeader {
+                type_id,
+                length: total_aligned as u32,
+                is_non_resident: 0,
+                name_length: attr_name.len() as u8,
+                name_offset: if attr_name.is_empty() {
+                    0
+                } else {
+                    name_off as u16
+                },
+                flags: 0,
+                id: 0,
+            },
+            value_length: value.len() as u32,
+            value_offset: value_off as u16,
+            indexed_flag: 0,
+            _pad: 0,
+        };
+        unsafe {
+            std::ptr::write_unaligned(
+                buf[start..].as_mut_ptr() as *mut NtfsResidentAttributeHeader,
+                header,
+            );
+        }
+        for (i, &u) in attr_name.iter().enumerate() {
+            let off = start + name_off + i * 2;
+            buf[off..off + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        buf[start + value_off..start + value_off + value.len()].copy_from_slice(value);
+    }
+
+    fn build_test_record(record_number: u64) -> Vec<u8> {
+        let record_size = 1024usize;
+        let attrs_offset = 56usize;
+        let mut buf = vec![0u8; record_size];
+        // USA layout: offset 42, count 3 (sentinel + 2 sectors).
+        let header = FileRecordHeader {
+            signature: *FILE_RECORD_SIGNATURE,
+            update_sequence_offset: 42,
+            update_sequence_length: 3,
+            logfile_sequence_number: 0,
+            sequence_value: 1,
+            link_count: 1,
+            attributes_offset: attrs_offset as u16,
+            flags: record_flags::IN_USE,
+            used_size: 0, // patched below
+            allocated_size: record_size as u32,
+            base_reference: 0,
+            next_attribute_id: 0,
+        };
+        unsafe {
+            std::ptr::write_unaligned(buf.as_mut_ptr() as *mut FileRecordHeader, header);
+        }
+        // Sentinel + replacements
+        buf[42] = 0xAB;
+        buf[43] = 0xCD;
+        buf[44] = 0x11;
+        buf[45] = 0x22;
+        buf[46] = 0x33;
+        buf[47] = 0x44;
+        buf[510] = 0xAB;
+        buf[511] = 0xCD;
+        buf[1022] = 0xAB;
+        buf[1023] = 0xCD;
+
+        // Build attributes from attrs_offset onwards.
+        let mut attrs = Vec::new();
+        // $STANDARD_INFORMATION
+        let si = NtfsStandardInformation {
+            creation_time: 132_000_000_000_000_000,
+            modification_time: 132_000_000_010_000_000,
+            mft_record_modification_time: 132_000_000_020_000_000,
+            access_time: 132_000_000_030_000_000,
+            file_attributes: 0x20,
+        };
+        let mut si_bytes = vec![0u8; size_of::<NtfsStandardInformation>()];
+        unsafe {
+            std::ptr::write_unaligned(si_bytes.as_mut_ptr() as *mut NtfsStandardInformation, si);
+        }
+        write_resident_attr(
+            &mut attrs,
+            NtfsAttributeType::StandardInformation as u32,
+            &[],
+            &si_bytes,
+        );
+        // $FILE_NAME (Win32 namespace)
+        let name: Vec<u16> = "hello.txt".encode_utf16().collect();
+        let fn_header = NtfsFileNameHeader {
+            parent_directory_reference: (5u64 << 48) | 5,
+            creation_time: 132_000_000_000_000_000,
+            modification_time: 132_000_000_010_000_000,
+            mft_record_modification_time: 132_000_000_020_000_000,
+            access_time: 132_000_000_030_000_000,
+            allocated_size: 4096,
+            real_size: 9,
+            file_attributes: 0x20,
+            reparse_point_tag: 0,
+            name_length: name.len() as u8,
+            namespace: FileNameNamespace::Win32 as u8,
+        };
+        let mut fn_bytes = vec![0u8; size_of::<NtfsFileNameHeader>() + name.len() * 2];
+        unsafe {
+            std::ptr::write_unaligned(fn_bytes.as_mut_ptr() as *mut NtfsFileNameHeader, fn_header);
+        }
+        for (i, &u) in name.iter().enumerate() {
+            let off = size_of::<NtfsFileNameHeader>() + i * 2;
+            fn_bytes[off..off + 2].copy_from_slice(&u.to_le_bytes());
+        }
+        write_resident_attr(
+            &mut attrs,
+            NtfsAttributeType::FileName as u32,
+            &[],
+            &fn_bytes,
+        );
+        // resident $DATA
+        write_resident_attr(&mut attrs, NtfsAttributeType::Data as u32, &[], b"abc12345");
+        // named $DATA (alternate stream)
+        let ads_name: Vec<u16> = "ads".encode_utf16().collect();
+        write_resident_attr(
+            &mut attrs,
+            NtfsAttributeType::Data as u32,
+            &ads_name,
+            b"alt",
+        );
+        // End marker
+        attrs.extend_from_slice(&(NtfsAttributeType::End as u32).to_le_bytes());
+        attrs.extend_from_slice(&0u32.to_le_bytes());
+
+        let used_size = attrs_offset + attrs.len();
+        // copy attrs in
+        buf[attrs_offset..attrs_offset + attrs.len()].copy_from_slice(&attrs);
+        // patch used_size in header (offset 24, 4 bytes)
+        buf[24..28].copy_from_slice(&(used_size as u32).to_le_bytes());
+
+        let _ = record_number;
+        buf
+    }
+
+    #[test]
+    fn builds_entry_from_synthetic_record() {
+        let mut buf = build_test_record(42);
+        let rec = FileRecord::parse(42, None, &mut buf).expect("parse");
+        let (entry, _) = RawMftEntry::from_record_with_attr_list(&rec, EntryBuildOptions::full());
+        assert_eq!(entry.record_number, 42);
+        assert_eq!(entry.file_name.to_string_lossy(), "hello.txt");
+        assert_eq!(entry.namespace, FileNameNamespace::Win32);
+        assert!(entry.is_used);
+        assert!(!entry.is_directory);
+        assert_eq!(entry.real_size, 8); // resident $DATA value len
+        assert!(entry.is_resident);
+        assert_eq!(entry.alternate_data_streams.len(), 1);
+        assert_eq!(
+            entry.alternate_data_streams[0].name.to_string_lossy(),
+            "ads"
+        );
+        assert_eq!(entry.alternate_data_streams[0].real_size, 3);
+        assert!(entry.si_created.raw() != 0);
+        assert_eq!(
+            entry.parent_reference,
+            NtfsFileReference::new((5u64 << 48) | 5)
+        );
+        assert!(entry.links.is_empty());
+        assert_eq!(
+            entry.parent_reference,
+            NtfsFileReference::new((5u64 << 48) | 5)
+        );
+        assert_eq!(entry.file_name.to_string_lossy(), "hello.txt");
+    }
+
+    #[test]
+    fn both_projections_preserve_unpaired_surrogates_from_disk() {
+        let mut buf = build_test_record(42);
+        // Replace one code unit in each name without changing attribute sizes.
+        for text in ["hello.txt", "ads"] {
+            let encoded: Vec<u8> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+            let offset = buf
+                .windows(encoded.len())
+                .position(|w| w == encoded)
+                .unwrap();
+            buf[offset..offset + 2].copy_from_slice(&0xd800u16.to_le_bytes());
+        }
+        let record = FileRecord::parse(42, None, &mut buf).unwrap();
+        let (rich, _) = RawMftEntry::from_record_with_attr_list(&record, EntryBuildOptions::full());
+        let (lean, _) =
+            super::super::batch::RawMftBatchScratch::from_record_with_attr_list(&record, true);
+        let lean = lean.into_entry();
+        assert_eq!(rich.file_name, lean.file_name);
+        assert_eq!(
+            rich.file_name.as_utf16(),
+            &[0xd800, 101, 108, 108, 111, 46, 116, 120, 116]
+        );
+        assert_eq!(
+            rich.alternate_data_streams[0].name.as_utf16(),
+            &[0xd800, 100, 115]
+        );
+        assert!(rich.file_name.try_to_string().is_err());
+    }
+
+    #[test]
+    fn raw_mft_entry_exposes_unmasked_fids() {
+        let mut buf = build_test_record(42);
+        let rec = FileRecord::parse(42, None, &mut buf).expect("parse");
+        let (entry, _) = RawMftEntry::from_record_with_attr_list(&rec, EntryBuildOptions::full());
+        // file_reference = (seq << 48) | record_number; with seq=1, record=42
+        assert_eq!(
+            entry.file_reference,
+            NtfsFileReference::new((1u64 << 48) | 42)
+        );
+        // parent_directory_reference was built as (5 << 48) | 5
+        assert_eq!(
+            entry.parent_reference,
+            NtfsFileReference::new((5u64 << 48) | 5)
+        );
+        assert_eq!(entry.file_name, NtfsName::from("hello.txt"));
+        assert!(!entry.is_directory);
+    }
+
+    #[test]
+    fn observed_metadata_keeps_zero_timestamps_and_disabled_ads_distinct() {
+        use crate::MftFieldState::{NotCollected, Present, Unknown};
+        let mut bytes = build_test_record(42);
+        let attrs = u16::from_le_bytes([bytes[20], bytes[21]]) as usize;
+        let value = u16::from_le_bytes([bytes[attrs + 20], bytes[attrs + 21]]) as usize;
+        bytes[attrs + value..attrs + value + 32].fill(0);
+        let record = FileRecord::parse(42, None, &mut bytes).unwrap();
+        for collect in [false, true] {
+            let (entry, _) = RawMftEntry::from_record_with_attr_list(
+                &record,
+                EntryBuildOptions {
+                    collect_alternate_data_streams: collect,
+                    collect_dos_file_name_links: true,
+                },
+            );
+            assert!(entry.si_created.is_zero());
+            let metadata = entry.metadata();
+            assert_eq!(metadata.standard_information, Present { complete: false });
+            assert_eq!(metadata.file_names, Present { complete: false });
+            assert_eq!(metadata.unnamed_data, Present { complete: false });
+            assert_eq!(metadata.reparse_point, Unknown);
+            assert_eq!(
+                metadata.alternate_data_streams,
+                if collect {
+                    Present { complete: false }
+                } else {
+                    NotCollected
+                }
+            );
+        }
+    }
+}

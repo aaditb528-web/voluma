@@ -1,0 +1,133 @@
+[package]
+name = "ntfs-mft"
+version = "0.1.0"
+edition = "2024"
+autoexamples = false
+exclude = [
+    ".github/**",
+    "AGENTS.md",
+    "clippy.toml",
+    "integration-tests/**",
+    "differential-tests/**",
+]
+description = "Read-only raw NTFS Master File Table parsing and serial/parallel scanning on Windows, Linux, and macOS."
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/wangfu91/ntfs-mft"
+documentation = "https://docs.rs/ntfs-mft"
+keywords = ["filesystem", "ntfs", "mft", "forensics"]
+categories = ["filesystem"]
+
+[workspace]
+members = ["differential-tests", "integration-tests"]
+resolver = "3"
+
+[workspace.dependencies]
+bitflags = "2.13.2"
+criterion = "0.8.2"
+libc = "0.2.189"
+log = "0.4.34"
+mft = { git = "https://github.com/omerbenamram/mft", rev = "dc36db7d3b83d68c0eecb75225c9955cfd7b2f2d", default-features = false }
+ntfs-mft = { path = "." }
+rustc-hash = "2.1.3"
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_IO",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_System_WindowsProgramming",
+    "Win32_System_Ioctl",
+    "Win32_System_Time",
+    "Win32_System_Threading",
+] }
+zerocopy = { version = "0.8.57", features = ["derive"] }
+
+[package.metadata.docs.rs]
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-pc-windows-msvc",
+    "i686-pc-windows-msvc",
+]
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(ntfs_mft_differential)'] }
+
+[dependencies]
+bitflags.workspace = true
+log.workspace = true
+rustc-hash.workspace = true
+thiserror.workspace = true
+zerocopy.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies.windows]
+workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+serde_json.workspace = true
+
+# User-facing examples.
+[[example]]
+name = "deletion_forensic"
+
+[[example]]
+name = "raw_mft_parallel_chunks"
+
+[[example]]
+name = "raw_mft_serial_read"
+
+# Benchmark-matching executables for flamegraphs and ETW captures.
+[[example]]
+name = "mft_stream_profile"
+path = "tools/profiling/mft_stream.rs"
+
+[[example]]
+name = "mft_stream_allocations_profile"
+path = "tools/profiling/mft_stream_allocations.rs"
+
+[[example]]
+name = "raw_mft_parallel_ingest_profile"
+path = "tools/profiling/raw_mft_parallel_ingest.rs"
+
+[[example]]
+name = "raw_mft_serial_read_profile"
+path = "tools/profiling/raw_mft_serial_read.rs"
+
+[[bench]]
+name = "raw_mft"
+harness = false
+
+[[bench]]
+name = "raw_mft_ingest"
+harness = false
+
+[[bench]]
+name = "mft_stream"
+harness = false
+
+[profile.test]
+opt-level = 0
+debug = true
+incremental = false
+
+[profile.bench]
+lto = "thin"
+
+[profile.release]
+debug = true

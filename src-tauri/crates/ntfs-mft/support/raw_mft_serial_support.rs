@@ -1,0 +1,184 @@
+#![allow(dead_code)] // The benchmark and profiler intentionally use different API subsets.
+
+//! Shared helpers for the serial raw-`$MFT` read benchmark and its
+//! exact-match profiling example.
+//!
+//! The serial read path produces a full [`RawMftEntry`] per visible record.
+//! Both the Criterion bench and the profiling executable drive the exact same
+//! [`run_serial_read`] workload so flamegraph and ETW results stay aligned with
+//! the benchmarked code.
+
+use std::{env, num::NonZeroUsize};
+
+use ntfs_mft::{
+    errors::MftError,
+    raw_mft::{RawMft, RawMftScanOptions},
+};
+
+#[path = "benchmark_volume.rs"]
+mod benchmark_volume;
+pub use benchmark_volume::open_volume;
+
+/// First normal FILE record number in the NTFS `$MFT`.
+const FIRST_NORMAL_RECORD: u64 = 24;
+
+/// Environment-driven configuration for the serial read benchmark.
+#[derive(Debug, Clone)]
+pub struct SerialConfig {
+    /// Drive letter used for the raw volume.
+    pub drive: char,
+    /// First logical record number to include.
+    pub start_record: u64,
+    /// Optional exclusive end record number; `None` means the full `$MFT`.
+    pub end_record: Option<u64>,
+    /// Optional cap on the number of visible records consumed per run.
+    pub max_records: Option<usize>,
+    /// Whether to collect named alternate data streams.
+    pub collect_alternate_data_streams: bool,
+    /// Whether to retain shadowed DOS 8.3 `$FILE_NAME` links.
+    pub collect_dos_file_name_links: bool,
+    /// Whether to include records the `$MFT` `$BITMAP` marks unused.
+    pub include_unused_records: bool,
+    /// Optional main read-buffer override used by buffer-size sweeps.
+    buffer_bytes: Option<NonZeroUsize>,
+}
+
+impl SerialConfig {
+    /// Build a configuration from environment variables and defaults.
+    pub fn from_env() -> Self {
+        Self {
+            drive: pick_drive(),
+            start_record: parse_env_u64("NTFS_MFT_SERIAL_START_RECORD")
+                .unwrap_or(FIRST_NORMAL_RECORD),
+            end_record: parse_env_u64("NTFS_MFT_SERIAL_END_RECORD"),
+            max_records: parse_env_usize("NTFS_MFT_SERIAL_MAX_RECORDS"),
+            collect_alternate_data_streams: parse_env_bool("NTFS_MFT_SERIAL_COLLECT_ADS", true),
+            collect_dos_file_name_links: parse_env_bool("NTFS_MFT_SERIAL_COLLECT_DOS", true),
+            include_unused_records: parse_env_bool("NTFS_MFT_SERIAL_INCLUDE_UNUSED", false),
+            buffer_bytes: None,
+        }
+    }
+
+    /// Return a copy with a different main read-buffer size.
+    #[must_use]
+    pub fn with_buffer_bytes(&self, buffer_bytes: NonZeroUsize) -> Self {
+        let mut config = self.clone();
+        config.buffer_bytes = Some(buffer_bytes);
+        config
+    }
+
+    /// Build the scan options that drive [`RawMft::scan_entries_with_options`].
+    pub fn scan_options(&self) -> RawMftScanOptions {
+        let builder = RawMftScanOptions::builder()
+            .include_unused_records(self.include_unused_records)
+            .collect_alternate_data_streams(self.collect_alternate_data_streams)
+            .collect_dos_file_name_links(self.collect_dos_file_name_links)
+            .start_record(self.start_record)
+            .end_record(self.end_record);
+        let builder = match self.buffer_bytes {
+            Some(buffer_bytes) => builder.buffer_bytes(buffer_bytes),
+            None => builder,
+        };
+        builder.build()
+    }
+}
+
+/// Compact, work-touching summary returned by the serial read workload.
+///
+/// Every field is derived from a materialized [`RawMftEntry`] so the optimizer
+/// cannot elide name/link/ADS materialization.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SerialSummary {
+    /// Number of visible base records yielded.
+    pub records: u64,
+    /// Zero for a completed workload; scan errors return `Err` instead of a summary.
+    pub errors: u64,
+    /// Sum of all file-name lengths (in UTF-16-ish chars) materialized.
+    pub name_chars: u64,
+    /// Sum of all retained hard-link names.
+    pub links: u64,
+    /// Sum of all alternate-data-stream entries.
+    pub ads: u64,
+    /// Running XOR of logical sizes, used as a cheap anti-elision checksum.
+    pub size_checksum: u64,
+}
+
+/// Read the drive letter to benchmark from `NTFS_MFT_TEST_DRIVE`.
+pub fn pick_drive() -> char {
+    env::var("NTFS_MFT_TEST_DRIVE")
+        .ok()
+        .and_then(|value| value.chars().next())
+        .map(|c| c.to_ascii_uppercase())
+        .unwrap_or('C')
+}
+
+/// Print the serial read configuration to stderr.
+pub fn print_serial_config(config: &SerialConfig) {
+    #[cfg(windows)]
+    let source = config.drive.to_string();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let source = env::var("NTFS_MFT_TEST_VOLUME")
+        .unwrap_or_else(|_| "<unset: set NTFS_MFT_TEST_VOLUME>".to_owned());
+    eprintln!(
+        "raw_mft serial read config: volume={} start_record={} end_record={} max_records={} ads={} dos={} unused={}",
+        source,
+        config.start_record,
+        config
+            .end_record
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "full".to_owned()),
+        config
+            .max_records
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "all".to_owned()),
+        config.collect_alternate_data_streams,
+        config.collect_dos_file_name_links,
+        config.include_unused_records,
+    );
+}
+
+/// Run the serial read workload and return a work-touching summary.
+///
+/// This iterates the raw `$MFT` serially, materializing a full
+/// [`RawMftEntry`] per visible record, and folds a handful of fields into the
+/// returned [`SerialSummary`].
+pub fn run_serial_read(mft: &RawMft<'_>, config: &SerialConfig) -> Result<SerialSummary, MftError> {
+    let mut summary = SerialSummary::default();
+    let iter = mft.scan_entries_with_options(config.scan_options())?;
+    let limit = config.max_records.unwrap_or(usize::MAX);
+    for item in iter.take(limit) {
+        let entry = item?;
+        summary.records += 1;
+        summary.name_chars += entry.file_name.as_utf16().len() as u64;
+        summary.links += entry.links.len() as u64;
+        summary.ads += entry.alternate_data_streams.len() as u64;
+        summary.size_checksum ^= entry.real_size ^ entry.allocated_size;
+    }
+    Ok(summary)
+}
+
+/// Parse a `u64` environment variable, returning `None` when unset or invalid.
+fn parse_env_u64(key: &str) -> Option<u64> {
+    env::var(key).ok().and_then(|value| value.parse().ok())
+}
+
+/// Parse a `usize` environment variable, returning `None` when unset or invalid.
+fn parse_env_usize(key: &str) -> Option<usize> {
+    env::var(key).ok().and_then(|value| value.parse().ok())
+}
+
+/// Parse a boolean environment variable (`0`/`false`/`no` disable it).
+fn parse_env_bool(key: &str, default: bool) -> bool {
+    match env::var(key) {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => default,
+    }
+}
+
+/// Convert a `usize` into a `NonZeroUsize`, clamping zero to one.
+pub fn nonzero_usize(value: usize) -> NonZeroUsize {
+    NonZeroUsize::new(value).unwrap_or(NonZeroUsize::MIN)
+}
