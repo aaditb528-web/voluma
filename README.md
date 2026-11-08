@@ -6,10 +6,10 @@ A modern, minimalist disk analyzer for Windows built with Rust and Tauri.
 
 
 ## Why Voluma?
-Tools like WizTree and WinDirStat are incredibly fast, but their interfaces are stuck in the Windows 98 era. Voluma was built to answer a simple question: **What if we had WizTree's performance, but with the clean, minimalist aesthetic of macOS?**
+Tools like WizTree and WinDirStat are incredibly fast, but their interfaces are stuck in the past. Voluma was built to answer a simple question: **What if we had WizTree's performance, but with the clean, minimalist aesthetic of macOS?**
 
 ## Features
-- **Incredibly Fast:** Reads the NTFS Master File Table (MFT) directly for sub-5-second scans of millions of files.
+- **Incredibly Fast:** Reads the NTFS Master File Table (MFT) directly, scans complete in seconds (depends on your cpu, it finished in 4.26 seconds on a 275HX and 15.14 seconds on a i7-1265U).
 - **macOS-Style UI:** Deep dark mode, clean segmented storage bar, and smooth virtualized tables.
 - **Accurate Physical Allocation:** Differentiates between logical file size and true on-disk allocated size (handling sparse files, compression, and hardlinks).
 - **Path-Based Categorization:** Intelligently categorizes space into Games, Developer, Apps, and System using path rules, not just file extensions.
