@@ -1,36 +1,26 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Voluma
 
-## Getting Started
+A modern, minimalist disk analyzer for Windows built with Rust and Tauri.
 
-First, run the development server:
+<img width="2560" height="1599" alt="image" src="https://github.com/user-attachments/assets/cbd11613-c43e-4c3d-bf17-999478ca1eb6" />
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
-```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+## Why Voluma?
+Tools like WizTree and WinDirStat are incredibly fast, but their interfaces are stuck in the Windows 98 era. Voluma was built to answer a simple question: **What if we had WizTree's performance, but with the clean, minimalist aesthetic of macOS?**
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Features
+- **Incredibly Fast:** Reads the NTFS Master File Table (MFT) directly for sub-5-second scans of millions of files.
+- **macOS-Style UI:** Deep dark mode, clean segmented storage bar, and smooth virtualized tables.
+- **Accurate Physical Allocation:** Differentiates between logical file size and true on-disk allocated size (handling sparse files, compression, and hardlinks).
+- **Path-Based Categorization:** Intelligently categorizes space into Games, Developer, Apps, and System using path rules, not just file extensions.
+- **Interactive Treemap:** Canvas-rendered squarified treemap with breadcrumbs and hover tooltips.
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Installation
+Download the latest `.exe` installer from the [Releases page](https://github.com/aaditb528-web/voluma/releases).
 
-## Learn More
+**Note:** Because this is an unsigned indie app, Windows SmartScreen might show a warning. Just click "More info" and then "Run anyway". Voluma requires Administrator privileges to read the raw disk.
 
-To learn more about Next.js, take a look at the following resources:
-
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
-
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Tech Stack
+- **Backend:** Rust (Tauri), `ntfs-mft` for raw disk parsing
+- **Frontend:** React, TypeScript, Tailwind CSS, D3-hierarchy
+- **Architecture:** In-memory Rust index with lazy-loaded frontend data fetching
